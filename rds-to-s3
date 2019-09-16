@@ -1,0 +1,158 @@
+#!/usr/bin/python
+
+import boto3
+import botocore
+import sys
+import os
+import threading
+from datetime import datetime
+
+
+def sts_client(aws_assume_role):
+    try:
+        sts_client = boto3.client('sts')
+        response = sts_client.assume_role(RoleArn = aws_assume_role,RoleSessionName = "AssumeRoleSession")
+        return response['Credentials']
+    except Exception as e:
+        print("An Error occured during STS assume role %s" % e)
+
+def client_connection(services,aws_credentials,aws_region):
+    try:
+        return boto3.client(services,aws_access_key_id = aws_credentials['AccessKeyId'],aws_secret_access_key = aws_credentials['SecretAccessKey'],
+                                 aws_session_token = aws_credentials['SessionToken'],region_name = aws_region)
+    except Exception as e:
+            print("An Error occured during Client Connection %s" % e)
+            
+def copy_logs_from_RDS_to_S3(rds_client,s3_client,region,account_id,aws_bucket_name,instance,engine_type_response):
+
+	lastWrittenTime = 0
+	lastWrittenThisRun = 0
+	backupStartTime = datetime.now()
+	configFileName = "{}{}{}{}{}{}{}{}{}".format(engine_type_response.get('DBInstances',{})[0].get('Engine',''),'/',account_id,'/',region,'/',instance,'/','backup_config')
+
+	# check if the S3 bucket exists and is accessible
+	try:
+		S3response = s3_client.head_bucket(Bucket=aws_bucket_name)
+	except botocore.exceptions.ClientError as e:
+		error_code = int(e.response['ResponseMetadata']['HTTPStatusCode'])
+		if error_code == 404:
+			print "Error: Bucket name provided not found"
+			return
+		else:
+			print "Error: Unable to access bucket name, error: " + e.response['Error']['Message']
+			return
+
+    # get the config file, if the config isn't present this is the first run
+	try:
+		S3response = s3_client.get_object(Bucket=aws_bucket_name, Key=configFileName)
+		lastWrittenTime = int(S3response['Body'].read(S3response['ContentLength']))
+		print("Found marker from last log download, retrieving log files with lastWritten time after %s" % str(lastWrittenTime))
+	except botocore.exceptions.ClientError as e:
+		error_code = int(e.response['ResponseMetadata']['HTTPStatusCode'])
+		if error_code == 404:
+			print "It appears this is the first log import, all files will be retrieved from RDS"
+		else:
+			print "Error: Unable to access config file, error: " + e.response['Error']['Message']
+			return
+		
+	# copy the logs in batches to s3
+	copiedFileCount = 0
+	logMarker = ""
+	moreLogsRemaining = True
+	while moreLogsRemaining:
+		dbLogs = rds_client.describe_db_log_files(DBInstanceIdentifier=instance, FileLastWritten=lastWrittenTime, Marker=logMarker)
+		if 'Marker' in dbLogs and dbLogs['Marker'] != "":
+			logMarker = dbLogs['Marker']
+		else:
+			moreLogsRemaining = False
+
+		# copy the logs in this batch
+		for dbLog in dbLogs['DescribeDBLogFiles']:
+			if int(dbLog['LastWritten']) > lastWrittenThisRun:
+				lastWrittenThisRun = int(dbLog['LastWritten'])
+			
+			# download the log file
+			logFileData = ""
+			try:
+				logFile = rds_client.download_db_log_file_portion(DBInstanceIdentifier=instance, LogFileName=dbLog['LogFileName'],Marker='0')
+				logFileData = logFile['LogFileData']
+				while logFile['AdditionalDataPending']:
+					logFile = rds_client.download_db_log_file_portion(DBInstanceIdentifier=instance, LogFileName=dbLog['LogFileName'],Marker=logFile['Marker'])
+					logFileData += logFile['LogFileData']
+			except Exception as e:
+				print "File download failed: ", e
+				continue
+			
+			if logFileData:
+				logFileAsBytes = str.encode(logFileData)
+
+				# upload the log file to S3
+
+				objectName = engine_type_response.get('DBInstances',{})[0].get('Engine','')+"/"+account_id+"/" +region + "/"+instance+"/"+ backupStartTime.strftime('%Y-%m-%d')+"/" + dbLog['LogFileName']+'-'+backupStartTime.isoformat()
+				try:
+					S3response = s3_client.put_object(Bucket=aws_bucket_name, Key=objectName,Body=logFileAsBytes,ServerSideEncryption = 'aws:kms')
+					copiedFileCount += 1
+				except botocore.exceptions.ClientError as e:
+					print "Error writting object to S3 bucket, S3 ClientError: " + e.response['Error']['Message']
+					return
+
+	print "Copied ", copiedFileCount, "file(s) to s3"
+
+	# Update the last written time in the config
+	if lastWrittenThisRun > 0:
+		try:
+			S3response = s3_client.put_object(Bucket=aws_bucket_name, Key=configFileName, Body=str.encode(str(lastWrittenThisRun)),ServerSideEncryption = 'aws:kms')			
+		except botocore.exceptions.ClientError as e:
+			print "Error writting the config to S3 bucket, S3 ClientError: " + e.response['Error']['Message']
+			return
+		print("Wrote new Last Written Marker to %s in Bucket %s" % (configFileName,aws_bucket_name))
+
+	print "Log file export complete"
+
+
+if __name__ == '__main__':
+
+	aws_bucket_name = os.environ['BucketName']
+	aws_instance = os.environ['RDSInstanceName']
+	aws_region = os.environ['Region']
+	cross_account_role = os.environ['CrossAccountRole'].split(',') 
+	marker =''
+	os.environ['http_proxy'] = '10.0.1.26:3128'
+	os.environ['https_proxy'] = '10.0.1.26:3128'
+	os.environ['no_proxy'] = '10.0.1.26:3128'
+	os.environ['HTTP_PROXY'] = '10.0.1.26:3128'
+	os.environ['HTTPS_PROXY'] = '10.0.1.26:3128'
+	os.environ['NO_PROXY'] = '10.0.1.26:3128'
+	s3_cred = sts_client('arn:aws:iam::XXXXXXXXXXXX:role/TestS3RDSLogs')
+	del os.environ['http_proxy']
+	del os.environ['https_proxy']
+	del os.environ['no_proxy']
+	del os.environ['HTTPS_PROXY']
+	del os.environ['HTTP_PROXY']
+	del os.environ['NO_PROXY']
+	s3_client = client_connection('s3',s3_cred,aws_region)
+	
+	for roles in cross_account_role:
+		aws_credentials = sts_client(roles)
+		rds_client = client_connection('rds',aws_credentials,aws_region)
+		instances = list()
+		instance_marker = True
+		if aws_instance == '*':
+			while instance_marker:
+			    response = rds_client.describe_db_instances(Marker = marker)
+			    if 'Marker' in response and not response.get('Marker',''):
+			        marker = response.get('Marker','')
+			    else:
+			        instance_marker = False 
+				
+			    for item in response.get('DBInstances',{}):
+			    	if item.get('Engine','') == 'postgres':
+			        	instances.append(item.get('DBInstanceIdentifier',''))
+
+			        if item.get('Engine','') == 'aurora-postgresql':
+			        	instances.append(item.get('DBInstanceIdentifier',''))
+		else:
+			instances.append(aws_instance)
+		for instance in instances:
+			engine_type_response = rds_client.describe_db_instances(DBInstanceIdentifier = instance)
+			copy_logs_from_RDS_to_S3(rds_client,s3_client,aws_region,roles.split(':')[4],aws_bucket_name,instance,engine_type_response)
