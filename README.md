@@ -12,7 +12,7 @@ This script will collect all logs of rds instance with engine type postgres,auro
 
 ## Usage
 
-We can use it as per our usage.It can run inside a jenkins, cron job, aws lambda.
+It can run inside a jenkins, cron job, aws lambda.
 
 - AWS Region
 - AWS RDS Instance
